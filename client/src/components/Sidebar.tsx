@@ -5,7 +5,7 @@ import {
   UsersIcon,
   Wand2Icon,
 } from "lucide-react";
-import { NavLink, useLocation } from "react-router-dom";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
 
 const Sidebar = ({
   isOpen,
@@ -14,14 +14,15 @@ const Sidebar = ({
   isOpen: boolean;
   setIsOpen: (val: boolean) => void;
 }) => {
+  const navigate = useNavigate();
+  const location = useLocation();
+
   const { logout, user } = {
     logout: () => {
-      window.location.href = "/";
+      navigate("/");
     },
     user: { name: "John Doe", email: "johndoe@example.com" },
   };
-
-  const location = useLocation();
 
   const navItems = [
     { name: "Dashboard", icon: LayoutDashboardIcon, path: "/dashboard" },
