@@ -280,19 +280,23 @@ Open the URL Vite prints (by default **http://localhost:5173**), create an accou
 | Variable | Required | Description |
 | --- | --- | --- |
 | `MONGODB_URI` | Yes | MongoDB connection string. The server exits on startup if it cannot connect. |
-| `JWT_SECRET` | Yes | Secret used to sign JWTs. **Always set this** — if missing, the code falls back to an insecure hard-coded default. |
-| `ZERNIO_API_KEY` | Yes | Zernio API key; needed to connect accounts and publish posts. |
+| `JWT_SECRET` | Yes | Secret used to sign JWTs; must be at least 32 characters. The server refuses to start if it is missing or too short. |
+| `CLIENT_URL` | Production | Full frontend origin, required in production (for example, `https://postpilot-web.onrender.com`). |
+| `CORS_ORIGINS` | Production | Comma-separated allowed browser origins. Set this to the frontend origin; `CLIENT_URL` is also allowed. |
+| `ZERNIO_API_KEY` | For social accounts | Zernio API key, needed to connect social accounts and publish posts. |
 | `GEMINI_API_KEY` | For AI Composer | Google Gemini API key for post text. |
+| `GEMINI_MODEL` | No | Preferred Gemini model. It is tried first, then the built-in fallbacks defined in `server/controllers/postControllers.ts`. Check those names against Google's current model list. |
 | `LEONARDO_API_KEY` | For AI images | Leonardo AI key. Only needed when "AI Images" is toggled on. |
 | `CLOUDINARY_CLOUD_NAME` `CLOUDINARY_API_KEY` `CLOUDINARY_API_SECRET` | For media | Needed for AI-generated images **and** for any image/video uploaded in the Scheduler. |
-| `PORT` | No | API port. Defaults to `5000`. |
-| `GEMINI_MODEL` | No | Preferred Gemini model. It is tried first, then the built-in fallbacks defined in `server/controllers/postControllers.ts`. Check those names against Google's current model list. |
+| `STRIPE_SECRET_KEY` `STRIPE_PRO_PRICE_ID` `STRIPE_WEBHOOK_SECRET` | For Stripe billing | Stripe credentials for checkout and subscription webhooks. |
+| `NODE_ENV` | Production | Set to `production` on the deployed API. |
+| `PORT` | Set by Render | Render supplies the listening port automatically; local development defaults to `5000`. |
 
 ### Client (`client/.env`)
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `VITE_API_BASE_URL` | No | Base URL of the API. Defaults to `http://localhost:5000`. Baked in at build time. |
+| `VITE_API_BASE_URL` | Production | Origin of the deployed API, e.g. `https://postpilot-api.onrender.com` (no `/api` suffix). Required for production builds and baked into the bundle. Local development defaults to `http://localhost:5000`. |
 
 > `.env` files are listed in `.gitignore` — never commit them.
 
@@ -468,7 +472,8 @@ Platforms are defined once in `client/src/assets/assets.tsx` (`PLATFORMS`), and 
 | --- | --- |
 | `npm run server` | Development mode — `nodemon` + `tsx`, restarts on changes |
 | `npm run build` | Compile TypeScript to `server/dist` |
-| `npm start` | Run the compiled build (`node dist/server.js`) |
+| `npm start` | Run the TypeScript source with `tsx` |
+| `npm run start:prod` | Run the compiled production build (`node dist/server.js`) |
 
 ### Client (`client/`)
 
@@ -483,12 +488,42 @@ Platforms are defined once in `client/src/assets/assets.tsx` (`PLATFORMS`), and 
 
 ## Deployment Notes
 
-- **Two deployables.** The API does not serve the frontend. Host `client/dist` on any static host (Vercel, Netlify, Cloudflare Pages, S3 + CDN, ...) and the API on a Node host (Render, Railway, Fly.io, a VPS, ...).
-- **Set `VITE_API_BASE_URL` at build time** to your deployed API URL — Vite inlines it into the bundle.
-- **SPA rewrites.** Configure the static host to serve `index.html` for unknown paths so React Router routes like `/dashboard` work on refresh. This also matters for the OAuth redirect back to `/accounts`.
-- **Keep the API process running.** The scheduler lives inside the API process, so hosts that put the app to sleep (or serverless platforms) will not publish posts on time. A single always-on instance is the simplest setup; the atomic claim logic is designed so only one instance can claim a given post if you scale out.
-- **Behind a reverse proxy?** Configure Express `trust proxy` so the rate limiter sees real client IPs.
-- **CORS** is currently open to all origins (`cors()`); restrict it to your frontend origin in production.
+- **Two deployables.** The API does not serve the frontend. Deploy the API as a Render Web Service and `client/` as a Render Static Site.
+- **Production builds require `VITE_API_BASE_URL`.** Set it to the API origin (without `/api`) before building the client. The build intentionally fails if it is missing rather than shipping a bundle pointed at localhost.
+- **SPA rewrites.** Configure the Render Static Site to rewrite `/*` to `/index.html` with status `200`, so React Router paths work on refresh and after OAuth redirects.
+- **Keep the API process running.** The scheduler runs inside the API process. Use a paid, always-on Web Service and one running instance to avoid extra scheduler workers; atomic claims and idempotency keys protect posts if you later scale out. A sleeping free service cannot publish while asleep.
+- **Configure CORS.** The API only allows the configured `CLIENT_URL` and `CORS_ORIGINS`; set both to the deployed frontend origin.
+- **MongoDB network access.** Allow the Render service's outbound IP ranges in MongoDB Atlas, and use a database user with a strong password.
+- **Behind a reverse proxy?** Express trusts the first proxy hop so the rate limiter sees the client IP from Render.
+
+### Deploying to Render
+
+Deploy the API and frontend as separate services from the same Git repository.
+
+1. **Prepare the external services.** Create a MongoDB Atlas database and database user. Collect the API keys you plan to use from Zernio, Google AI Studio, Leonardo AI, Cloudinary, and Stripe. Choose unique Render service names for the API and frontend so their public URLs are predictable. Features requiring an unconfigured provider will not work.
+2. **Create the API Web Service.** In Render, choose **New + → Web Service**, connect this repository and branch, select **Node** as the runtime, and set **Root Directory** to `server`. For example, name it `postpilot-api`.
+   - Build Command: `npm ci --include=dev && npm run build`
+   - Start Command: `npm run start:prod`
+   - Health Check Path: `/health`
+   - Use Node.js 22 or newer.
+3. **Set API environment variables** in the Web Service's **Environment** settings:
+   - `NODE_ENV` = `production`
+   - `MONGODB_URI` = your Atlas connection URI (ensure the database username/password are URL-encoded if they contain special characters)
+   - `JWT_SECRET` = a newly generated random secret of at least 32 characters. Generate one locally with Node.js: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. Copy the output directly into Render's secret field; do not commit it.
+   - `CLIENT_URL` = the expected Static Site URL, e.g. `https://postpilot-web.onrender.com` (choose the Static Site name `postpilot-web` in step 5)
+   - `CORS_ORIGINS` = the same frontend origin, without a trailing slash
+   - Add provider keys as required: `ZERNIO_API_KEY`, `GEMINI_API_KEY`, `GEMINI_MODEL` (optional), `LEONARDO_API_KEY`, `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `STRIPE_SECRET_KEY`, `STRIPE_PRO_PRICE_ID`, and `STRIPE_WEBHOOK_SECRET`.
+   - Do not set `PORT` manually; Render provides it.
+   - In MongoDB Atlas **Network Access**, allow the outbound IP ranges shown in the Render API service settings.
+4. **Deploy the API** and wait for `/health` to report `{"status":"ok"}`. Copy the service's public URL, for example `https://postpilot-api.onrender.com`.
+5. **Create the frontend Static Site.** Choose **New + → Static Site**, connect the same repository and branch, and set **Root Directory** to `client`.
+   - Build Command: `npm ci --include=dev && npm run build`
+   - Publish Directory: `dist`
+   - Set the build environment variable `VITE_API_BASE_URL` to the API origin copied in step 4 (for example, `https://postpilot-api.onrender.com`, without a trailing slash or `/api`).
+   - Add a rewrite route `/*` → `/index.html` with action **Rewrite** and status `200`.
+6. **Finish the API CORS setup.** Confirm the Static Site's actual public URL matches the origin set in `CLIENT_URL` and `CORS_ORIGINS`. If Render assigned a different URL, or you use a custom frontend domain, update both API variables (no trailing slash) and redeploy the API.
+7. **Verify the deployment.** Open the frontend URL, register/log in, and confirm the dashboard loads. Test media upload and each external integration you enabled. For social OAuth, register the deployed frontend callback/redirect URL with the provider through Zernio. If using Stripe, point the Stripe webhook endpoint at `https://<api-host>/api/stripe/webhook` and use its signing secret for `STRIPE_WEBHOOK_SECRET`.
+8. **Keep the scheduler available.** Use an always-on paid API instance and keep one instance running. Render's free Web Services can spin down when idle, during which the in-process scheduler cannot publish scheduled posts.
 
 ---
 
@@ -496,8 +531,8 @@ Platforms are defined once in `client/src/assets/assets.tsx` (`PLATFORMS`), and 
 
 Things to be aware of before using this in production:
 
-- **Set a strong `JWT_SECRET`.** The code falls back to a hard-coded value when it is missing.
-- **Open CORS** and **JWTs stored in `localStorage`** (30-day lifetime) — consider restricting origins and shortening/refreshing tokens.
+- **JWTs are stored in `localStorage`** (30-day lifetime) — consider shortening/refreshing tokens for higher-risk deployments.
+- **CORS** is restricted to the configured `CLIENT_URL` and `CORS_ORIGINS`; maintain those values when frontend domains change.
 - **Minimal input validation on sign-up** — no server-side email-format or password-strength checks yet.
 - **Rate limit vs. polling.** The API allows 100 requests / 15 min / IP, while the Scheduler page polls `/api/posts` every 10 seconds (about 90 requests per 15 minutes on its own). Heavy use of that page can trigger `429` responses; raise the limit, poll less often, or scope the limiter per route.
 - **Post length.** The manual composer caps content at 280 characters for every platform, but AI-generated posts are not length-checked, so a long AI post sent to X / Twitter may be rejected and appear under *Needs attention*.
